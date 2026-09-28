@@ -1,0 +1,5 @@
+streamlit>=1.40
+polars>=1.0
+gspread>=6.0
+google-auth>=2.0
+pyarrow>=15.0
