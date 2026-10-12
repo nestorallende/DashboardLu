@@ -166,9 +166,12 @@ def hex_to_rgb(hex_color: str) -> dict:
 
 def apply_colors_to_sheet(ws: gspread.Worksheet, df: pl.DataFrame, color_dict: dict) -> None:
     requests = []
-    ncols = len([col for col in df.columns if col != "_fila"])
+    cols_pintar = [col for col in df.columns if col != "_fila" and not col.startswith("Col ")]
+    ncols = len(cols_pintar) if cols_pintar else len(BASE_COLS)
     for row in df.iter_rows(named=True):
         reg = str(row.get("Registro", "")).strip().upper()
+        if not reg:
+            reg = "PENDIENTE"
         c = color_dict.get(reg, "")
         fila = int(row["_fila"])
         rgb = hex_to_rgb(c) if c and c.startswith("#") else {"red": 1.0, "green": 1.0, "blue": 1.0}
@@ -198,6 +201,7 @@ def is_config_sheet(title: str) -> bool:
 
 def get_default_config() -> list[dict[str, str]]:
     return [
+        {"Valor": "PENDIENTE", "Color Hex": "#fff2cc", "Completado": "No"},
         {"Valor": "PRESENTADO", "Color Hex": "#ead1dc", "Completado": "No"},
         {"Valor": "SUBIDO", "Color Hex": "#c9daf8", "Completado": "Sí"},
     ]
@@ -440,9 +444,9 @@ with tab_met:
         st.subheader("Distribución general por Opciones (Registro)")
         import altair as alt
         
-        # Generar datos agrupados por Registro
+        # Generar datos agrupados por Registro (vacíos cuentan como PENDIENTE)
         reg_df = df.filter(pl.col("_tiene_exp")).with_columns(
-            pl.col("Registro").str.to_uppercase().replace("", "VACÍO").alias("Registro")
+            pl.col("Registro").str.to_uppercase().replace("", "PENDIENTE").alias("Registro")
         ).group_by("Registro").agg(pl.len().alias("Cantidad"))
         reg_pd = reg_df.to_pandas()
         
@@ -451,7 +455,12 @@ with tab_met:
         range_ = []
         for r_val in reg_pd["Registro"].unique():
             domain.append(r_val)
-            range_.append(color_dict.get(r_val, "#1f77b4")) # Azul por defecto si no hay color
+            if r_val in color_dict:
+                range_.append(color_dict[r_val])
+            elif r_val == "PENDIENTE":
+                range_.append(color_dict.get("PENDIENTE", "#fff2cc"))
+            else:
+                range_.append("#1f77b4")
         
         pie = alt.Chart(reg_pd).mark_arc(innerRadius=40).encode(
             theta=alt.Theta(field="Cantidad", type="quantitative"),
@@ -489,7 +498,7 @@ with tab_met:
             st.dataframe(bank, hide_index=True)
 
         st.subheader("Pendientes de registro")
-        pend = df.filter(pl.col("_pend")).select("_fila", "Expediente", "Banco", "Registro", "Observaciones")
+        pend = df.filter(pl.col("_pend")).select("Expediente", "Banco", "Registro", "Observaciones")
         st.dataframe(pend, hide_index=True)
 
 # ---------- Editar ----------
@@ -512,39 +521,45 @@ with tab_edit:
             "Duplicados": pl.col("_dup") & pl.col("_tiene_exp"),
         }[vista]
         buscar = st.text_input("Buscar (expediente, banco u observación)", "")
-        view = df.filter(filtro).select(df_raw.columns)
+
+        # Filtrar columnas sin título (ej: Col E, Col F) y separar _fila para no mostrarla en la interfaz
+        cols_mostrar = [c for c in df_raw.columns if not c.startswith("Col ")]
+        cols_editables = [c for c in cols_mostrar if c != "_fila"]
+
+        view = df.filter(filtro).select(cols_mostrar)
         if buscar:
             q = buscar.lower()
             view = view.filter(
                 pl.any_horizontal(pl.col(c).str.to_lowercase().str.contains(q, literal=True)
-                                  for c in view.columns if c != "_fila")
+                                  for c in cols_editables)
             )
 
         def row_style(row):
             reg = str(row.get("Registro", "")).strip().upper()
+            if not reg:
+                reg = "PENDIENTE"
             color = color_dict.get(reg, "")
             return [f"background-color: {color}; color: #000000" if color else ""] * len(row)
 
-        view_pd = view.to_pandas()
+        view_pd = view.select(cols_editables).to_pandas()
         styled_view = view_pd.style.apply(row_style, axis=1)
 
         edited = st.data_editor(
             styled_view,
             hide_index=True,
-            disabled=["_fila"],
-            column_config={"_fila": st.column_config.NumberColumn("Fila", format="%d")},
+            use_container_width=True,
             key=f"editor_{ws_title}_{vista}_{buscar}",
         )
         if not isinstance(edited, pl.DataFrame):
             edited = pl.from_pandas(edited)
 
-        # Detectar celdas cambiadas
-        cols = [c for c in view.columns if c != "_fila"]
+        # Detectar celdas cambiadas vinculando _fila de view
         updates: list[tuple[int, int, str]] = []
         for old, new in zip(view.iter_rows(named=True), edited.iter_rows(named=True)):
-            for col in cols:
+            fila = old["_fila"]
+            for col in cols_editables:
                 if (old[col] or "") != (new[col] or ""):
-                    updates.append((old["_fila"], df_raw.columns.index(col), new[col] or ""))
+                    updates.append((fila, df_raw.columns.index(col), new[col] or ""))
         # df_raw.columns incluye _fila en la posición 0 → índice = posición de columna (1-based)
 
         cc = st.columns([2, 2, 2])
@@ -683,7 +698,7 @@ with tab_comp:
                 import altair as alt
                 
                 reg_df = global_df.filter(pl.col("_tiene_exp")).with_columns(
-                    pl.col("Registro").str.to_uppercase().replace("", "VACÍO").alias("Registro")
+                    pl.col("Registro").str.to_uppercase().replace("", "PENDIENTE").alias("Registro")
                 ).group_by("Registro").agg(pl.len().alias("Cantidad"))
                 reg_pd = reg_df.to_pandas()
                 
@@ -691,7 +706,12 @@ with tab_comp:
                 range_ = []
                 for r_val in reg_pd["Registro"].unique():
                     domain.append(r_val)
-                    range_.append(color_dict.get(r_val, "#1f77b4"))
+                    if r_val in color_dict:
+                        range_.append(color_dict[r_val])
+                    elif r_val == "PENDIENTE":
+                        range_.append(color_dict.get("PENDIENTE", "#fff2cc"))
+                    else:
+                        range_.append("#1f77b4")
                 
                 pie = alt.Chart(reg_pd).mark_arc(innerRadius=40).encode(
                     theta=alt.Theta(field="Cantidad", type="quantitative"),
