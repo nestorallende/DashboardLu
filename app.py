@@ -154,23 +154,24 @@ def write_cells(ws: gspread.Worksheet, updates: list[tuple[int, int, str]]) -> N
     )
     load_values.clear()
 
+def hex_to_rgb(hex_color: str) -> dict:
+    h = str(hex_color).lstrip('#')
+    if len(h) == 6:
+        try:
+            return {"red": int(h[0:2], 16) / 255.0, "green": int(h[2:4], 16) / 255.0, "blue": int(h[4:6], 16) / 255.0}
+        except ValueError:
+            pass
+    return {"red": 1.0, "green": 1.0, "blue": 1.0}
+
+
 def apply_colors_to_sheet(ws: gspread.Worksheet, df: pl.DataFrame, color_dict: dict) -> None:
     requests = []
-    
-    def hex_to_rgb(hex_color: str) -> dict:
-        h = hex_color.lstrip('#')
-        if len(h) == 6:
-            return {"red": int(h[0:2], 16)/255.0, "green": int(h[2:4], 16)/255.0, "blue": int(h[4:6], 16)/255.0}
-        return {"red": 1.0, "green": 1.0, "blue": 1.0}
-        
+    ncols = len([col for col in df.columns if col != "_fila"])
     for row in df.iter_rows(named=True):
         reg = str(row.get("Registro", "")).strip().upper()
         c = color_dict.get(reg, "")
         fila = int(row["_fila"])
-        
-        # Determine color
         rgb = hex_to_rgb(c) if c and c.startswith("#") else {"red": 1.0, "green": 1.0, "blue": 1.0}
-        
         requests.append({
             "repeatCell": {
                 "range": {
@@ -178,20 +179,116 @@ def apply_colors_to_sheet(ws: gspread.Worksheet, df: pl.DataFrame, color_dict: d
                     "startRowIndex": fila - 1,
                     "endRowIndex": fila,
                     "startColumnIndex": 0,
-                    "endColumnIndex": len([col for col in df.columns if col != "_fila"])
+                    "endColumnIndex": ncols,
                 },
                 "cell": {"userEnteredFormat": {"backgroundColor": rgb}},
-                "fields": "userEnteredFormat.backgroundColor"
+                "fields": "userEnteredFormat.backgroundColor",
             }
         })
-        
     if requests:
         ws.spreadsheet.batch_update({"requests": requests})
 
 
+CONFIG_SHEET_NAME = "Configuraciones"
+
+
+def is_config_sheet(title: str) -> bool:
+    return title.strip().upper() in ["CONFIGURACIONES", "CONFIGURACION", "CONFIG"]
+
+
+def get_default_config() -> list[dict[str, str]]:
+    return [
+        {"Valor": "PRESENTADO", "Color Hex": "#ead1dc", "Completado": "No"},
+        {"Valor": "SUBIDO", "Color Hex": "#c9daf8", "Completado": "Sí"},
+    ]
+
+
+def load_config_from_sheet(sh: gspread.Spreadsheet) -> tuple[list[dict[str, str]], str]:
+    default_cfg = get_default_config()
+    default_ok = "SUBIDO"
+    try:
+        ws_list = [w for w in sh.worksheets() if is_config_sheet(w.title)]
+        if not ws_list:
+            return default_cfg, default_ok
+        ws = ws_list[0]
+        vals = ws.get_all_values()
+        if not vals or len(vals) <= 1:
+            return default_cfg, default_ok
+
+        start_row = 1 if any("estado" in c.lower() or "valor" in c.lower() for c in vals[0]) else 0
+        cfg_rows = []
+        found_ok = None
+        for r in vals[start_row:]:
+            if not r or not r[0].strip():
+                continue
+            estado = r[0].strip().upper()
+            color = r[1].strip() if len(r) > 1 and r[1].strip() else "#c9daf8"
+            if not color.startswith("#") and len(color) == 6:
+                color = "#" + color
+            comp_str = r[2].strip().lower() if len(r) > 2 and r[2].strip() else ""
+            is_comp = comp_str in ["sí", "si", "true", "1", "completado", "yes"] or (estado == "SUBIDO" and not comp_str)
+            if is_comp and not found_ok:
+                found_ok = estado
+            cfg_rows.append({"Valor": estado, "Color Hex": color, "Completado": "Sí" if is_comp else "No"})
+
+        if cfg_rows:
+            return cfg_rows, (found_ok or "SUBIDO")
+    except Exception:
+        pass
+    return default_cfg, default_ok
+
+
+def save_config_to_sheet(sh: gspread.Spreadsheet, cfg_list: list[dict[str, str]], label_ok: str) -> None:
+    ws = None
+    for w in sh.worksheets():
+        if is_config_sheet(w.title):
+            ws = w
+            break
+    if ws is None:
+        ws = sh.add_worksheet(title=CONFIG_SHEET_NAME, rows="100", cols="10")
+
+    rows = [["Estado", "Color Hex", "Completado", "Muestra Visual"]]
+    ok_upper = label_ok.strip().upper()
+    for item in cfg_list:
+        v = str(item.get("Valor", "")).strip().upper()
+        if not v:
+            continue
+        c = str(item.get("Color Hex", "")).strip()
+        comp = "Sí" if v == ok_upper or item.get("Completado", "") in ["Sí", "si", True] else "No"
+        rows.append([v, c, comp, v])
+
+    ws.clear()
+    ws.update(range_name="A1", values=rows)
+
+    reqs = [
+        {
+            "repeatCell": {
+                "range": {"sheetId": ws.id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 4},
+                "cell": {"userEnteredFormat": {"textFormat": {"bold": True}, "backgroundColor": {"red": 0.93, "green": 0.93, "blue": 0.93}}},
+                "fields": "userEnteredFormat(textFormat,backgroundColor)",
+            }
+        }
+    ]
+    for idx, item in enumerate(cfg_list, start=1):
+        color_rgb = hex_to_rgb(item.get("Color Hex", "#ffffff"))
+        reqs.append({
+            "repeatCell": {
+                "range": {"sheetId": ws.id, "startRowIndex": idx, "endRowIndex": idx + 1, "startColumnIndex": 3, "endColumnIndex": 4},
+                "cell": {"userEnteredFormat": {"backgroundColor": color_rgb, "textFormat": {"bold": True}}},
+                "fields": "userEnteredFormat(backgroundColor,textFormat)",
+            }
+        })
+    try:
+        ws.spreadsheet.batch_update({"requests": reqs})
+    except Exception:
+        pass
+    load_values.clear()
+
+
 # ───────────────────────────── Sidebar ─────────────────────────────
 with st.sidebar:
-    st.title("⚙️ Configuración")
+    st.title("📋 LuDash")
+    st.caption("Control de expedientes")
 
     st.subheader("1. Hoja de Google")
     sheet_url = st.text_input(
@@ -202,11 +299,10 @@ with st.sidebar:
         help="Pega el link completo. La hoja debe estar compartida con el usuario virtual.",
     ).strip()
 
-    st.subheader("2. Credenciales (usuario virtual)")
-    st.file_uploader("Archivo JSON de la key", type="json", key="cred_file")
-    st.text_area("…o pega el contenido del JSON", key="cred_text", height=90)
-    st.caption("También se leen desde `st.secrets['gcp_service_account']`. "
-               "Mira la pestaña **Instrucciones**.")
+    with st.expander("🔑 Credenciales de servicio", expanded=False):
+        st.file_uploader("Archivo JSON de la key", type="json", key="cred_file")
+        st.text_area("…o pega el contenido del JSON", key="cred_text", height=70)
+        st.caption("También se leen desde `st.secrets['gcp_service_account']`.")
 
     creds_json = get_credentials_json()
     ws_title = None
@@ -216,20 +312,26 @@ with st.sidebar:
     if sheet_url and creds_json:
         try:
             sh = open_sheet(creds_json, sheet_url)
-            titles = [w.title for w in sh.worksheets()]
-            default = len(titles) - 1
-            for i, t in enumerate(titles):  # intenta seleccionar el mes actual
+            all_ws = [w.title for w in sh.worksheets()]
+            # Filtrar hojas que sean de configuración para los meses
+            data_titles = [t for t in all_ws if not is_config_sheet(t)]
+            if not data_titles:
+                data_titles = all_ws
+
+            default = len(data_titles) - 1
+            for i, t in enumerate(data_titles):
                 if t.strip().upper().startswith(MESES[datetime.now().month - 1][:3]):
                     default = i
-            st.subheader("3. Hoja del mes")
-            ws_title = st.selectbox("Pestaña", titles, index=default)
-            
+
+            st.subheader("2. Pestaña del mes")
+            ws_title = st.selectbox("Mes activo", data_titles, index=default)
+
             with st.expander("➕ Crear nueva hoja (mes)"):
-                new_month = st.text_input("Nombre de la nueva hoja", placeholder="Ej: Octubre")
+                new_month = st.text_input("Nombre de la nueva hoja", placeholder="Ej: Noviembre")
                 if st.button("Crear hoja"):
                     if not new_month.strip():
                         st.error("Ingresa un nombre para la hoja.")
-                    elif new_month.strip() in titles:
+                    elif new_month.strip() in all_ws:
                         st.error("La hoja ya existe.")
                     else:
                         new_ws = sh.add_worksheet(title=new_month.strip(), rows="1000", cols="20")
@@ -238,65 +340,66 @@ with st.sidebar:
                         load_values.clear()
                         st.rerun()
 
-            st.success(f"Conectado: {sh.title}")
+            st.success(f"Conectado: {sh.title}", icon="✅")
             try:
-                st.caption("Usuario virtual: `" + json.loads(creds_json)["client_email"] + "`")
+                st.caption(f"Cuenta: `{json.loads(creds_json)['client_email']}`")
             except Exception:
                 pass
         except json.JSONDecodeError:
             error = "El JSON de credenciales no es válido."
         except gspread.SpreadsheetNotFound:
             error = "No se encontró la hoja. ¿La compartiste con el usuario virtual?"
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             error = f"No se pudo conectar: {e}"
         if error:
             st.error(error)
     else:
         st.info("Ingresa el link y las credenciales para conectar.")
 
-    st.subheader("4. Parámetros")
-    header_mode = st.selectbox("¿La primera fila es encabezado?", ["Auto", "Sí", "No"],
-                               help="Las columnas se leen por posición: A=Expediente, B=Banco, "
-                                    "C=Registro, D=Observaciones.")
-    label_ok = st.text_input("Valor de Registro que cuenta como completado", value="SUBIDO")
-    meta = st.number_input("Meta de expedientes del mes (0 = sin meta)", min_value=0, value=0, step=10)
+    # Cargar y gestionar estados en session_state
+    if sh is not None and "app_config_list" not in st.session_state:
+        cfg_list, loaded_ok = load_config_from_sheet(sh)
+        st.session_state.app_config_list = cfg_list
+        st.session_state.label_ok = loaded_ok
 
-    st.subheader("5. Colores (Registro)")
-    st.caption("Resalta filas enteras según el valor en 'Registro'.")
-    import pandas as pd
-    if "colors_df" not in st.session_state:
-        st.session_state.colors_df = pd.DataFrame({"Valor": ["DESPACHO", "SUBIDO"], "Color Hex": ["#ffeb3b", "#c8e6c9"]})
-    
-    # Limpiar posibles "None" que se hayan filtrado por el bug anterior
-    st.session_state.colors_df = st.session_state.colors_df.dropna(how="all").fillna("")
-    
-    color_df = st.data_editor(
-        st.session_state.colors_df,
-        num_rows="dynamic",
-        hide_index=True,
-        use_container_width=True,
-        key="editor_de_colores",
-        column_config={
-            "Valor": st.column_config.TextColumn("Valor"),
-            "Color Hex": st.column_config.TextColumn("Color (Hex o nombre)", help="Ej: #ff0000, yellow, lightblue")
-        }
-    )
-    
-    # Actualizamos el estado solo con valores válidos (sin 'None')
-    if color_df is not None:
-        st.session_state.colors_df = color_df.fillna("")
+    if "app_config_list" not in st.session_state:
+        st.session_state.app_config_list = get_default_config()
+        st.session_state.label_ok = "SUBIDO"
 
-    color_dict = {str(k).strip().upper(): str(v).strip() for k, v in zip(color_df["Valor"], color_df["Color Hex"]) if str(k).strip() and str(k).strip() != "None"}
+    # Diccionario rápido de colores
+    color_dict = {
+        str(item.get("Valor", "")).strip().upper(): str(item.get("Color Hex", "")).strip()
+        for item in st.session_state.app_config_list
+        if str(item.get("Valor", "")).strip()
+    }
+    label_ok = st.session_state.get("label_ok", "SUBIDO")
+
+    st.divider()
+    st.subheader("3. Estados de registro")
+    badge_html = " ".join([
+        f'<span style="background-color: {item.get("Color Hex", "#eee")}; color: #000; padding: 2px 7px; border-radius: 4px; font-size: 11px; font-weight: bold; border: 1px solid rgba(0,0,0,0.1); margin-right: 4px;">{item.get("Valor")}{" ✓" if item.get("Valor") == label_ok else ""}</span>'
+        for item in st.session_state.app_config_list
+    ])
+    st.markdown(badge_html, unsafe_allow_html=True)
+    st.caption("Gestiona o agrega estados en la pestaña **⚙️ Configuración**.")
 
     if st.button("🔄 Recargar datos", use_container_width=True):
         load_values.clear()
+        if sh is not None:
+            cfg_list, loaded_ok = load_config_from_sheet(sh)
+            st.session_state.app_config_list = cfg_list
+            st.session_state.label_ok = loaded_ok
         st.rerun()
 
 
+# Parámetros generales
+header_mode = st.session_state.get("header_mode_select", "Auto")
+meta = st.session_state.get("meta_input", 0)
+
 # ───────────────────────────── Contenido ─────────────────────────────
 st.title("📋 Control de expedientes")
-tab_met, tab_edit, tab_comp, tab_help = st.tabs(
-    ["📊 Métricas", "✏️ Editar hoja", "📅 Comparativo mensual", "🔑 Instrucciones"]
+tab_met, tab_edit, tab_comp, tab_conf, tab_help = st.tabs(
+    ["📊 Métricas", "✏️ Editar hoja", "📅 Comparativo mensual", "⚙️ Configuración", "🔑 Instrucciones"]
 )
 
 df = None
@@ -466,7 +569,10 @@ with tab_edit:
             opciones = {f"{r['Expediente']} · {r['Banco']}": r["_fila"] for r in pend_list.iter_rows(named=True)}
             sel = st.multiselect("Expedientes pendientes", list(opciones))
             
-            n_estado = st.text_input("Nuevo Registro", value=label_ok.upper())
+            current_states = [item["Valor"] for item in st.session_state.app_config_list if item.get("Valor")]
+            default_state_idx = current_states.index(label_ok) if label_ok in current_states else 0
+            sel_estado = st.selectbox("Nuevo Registro", current_states + ["(otro)"], index=default_state_idx)
+            n_estado = st.text_input("Especificar otro registro") if sel_estado == "(otro)" else sel_estado
             n_obs = st.text_input("Agregar/Cambiar Observación (Opcional)")
 
             if st.button(f"✅ Actualizar {len(sel)} expediente(s)", disabled=not sel):
@@ -489,7 +595,8 @@ with tab_edit:
                 bancos = sorted({b for b in df["Banco"].to_list() if b})
                 n_banco = st.selectbox("Banco", bancos + ["(otro)"])
                 n_otro = st.text_input("Otro banco (si elegiste '(otro)')")
-                n_reg = st.text_input("Registro", value=label_ok.upper())
+                sel_n_reg = st.selectbox("Registro", current_states + ["(otro)"], index=default_state_idx)
+                n_reg = st.text_input("Especificar otro registro") if sel_n_reg == "(otro)" else sel_n_reg
                 n_obs = st.text_input("Observaciones")
                 if st.form_submit_button("➕ Agregar al final de la hoja"):
                     if not n_exp.strip():
@@ -512,10 +619,13 @@ with tab_comp:
         st.write("Visión Global: Resume los datos de las pestañas (meses) seleccionados.")
         
         titles = [w.title for w in sh.worksheets()]
-        selected_months = st.multiselect("Filtrar meses (deja vacío para analizarlos TODOS)", titles, default=[])
+        data_titles = [t for t in titles if not is_config_sheet(t)]
+        if not data_titles:
+            data_titles = titles
+        selected_months = st.multiselect("Filtrar meses (deja vacío para analizarlos TODOS)", data_titles, default=[])
         
         if st.button("📅 Generar Reporte Global", type="primary"):
-            meses_a_leer = selected_months if selected_months else titles
+            meses_a_leer = selected_months if selected_months else data_titles
             
             all_dfs = []
             filas_mensuales = []
@@ -601,6 +711,140 @@ with tab_comp:
                     st.altair_chart(pie, use_container_width=True)
                 with c_bar_opt:
                     st.altair_chart(bar_opts, use_container_width=True)
+
+# ---------- Configuración ----------
+with tab_conf:
+    st.subheader("⚙️ Configuración de Estados y Colores")
+    st.markdown(
+        "Personaliza los estados para clasificar tus expedientes (por ejemplo **PRESENTADO** y **SUBIDO**), "
+        "asigna colores visualmente y sincronízalos directamente con la pestaña **Configuraciones** en Google Sheets."
+    )
+
+    if sh is None:
+        st.warning("⚠️ Conecta tu hoja de Google en el panel lateral para poder sincronizar las configuraciones.")
+    else:
+        # Botones de acción principales
+        col_s1, col_s2, col_s3 = st.columns([2, 2, 2])
+        with col_s1:
+            if st.button("📤 Guardar en Google Sheets", type="primary", use_container_width=True, help="Sube los estados y colores a la pestaña 'Configuraciones'"):
+                with st.spinner("Guardando en la hoja Configuraciones..."):
+                    save_config_to_sheet(sh, st.session_state.app_config_list, st.session_state.label_ok)
+                st.success("¡Configuración guardada y formateada en la pestaña Configuraciones de Google Sheets!")
+        with col_s2:
+            if st.button("📥 Cargar desde Google Sheets", use_container_width=True, help="Lee los estados guardados en la pestaña 'Configuraciones'"):
+                with st.spinner("Leyendo hoja Configuraciones..."):
+                    cfg_list, loaded_ok = load_config_from_sheet(sh)
+                    st.session_state.app_config_list = cfg_list
+                    st.session_state.label_ok = loaded_ok
+                st.success("¡Configuración cargada desde Google Sheets!")
+                st.rerun()
+        with col_s3:
+            if ws_title and df is not None:
+                if st.button(f"🎨 Pintar mes actual ({ws_title})", use_container_width=True, help="Aplica los colores configurados a todas las filas en Google Sheets"):
+                    with st.spinner("Pintando filas en Google Sheets..."):
+                        ws_curr = sh.worksheet(ws_title)
+                        apply_colors_to_sheet(ws_curr, df, color_dict)
+                    st.success(f"¡Filas del mes {ws_title} pintadas exitosamente!")
+
+    st.divider()
+
+    # Opciones para cuál estado cuenta como completado
+    st.subheader("Estados registrados")
+    st.caption("Selecciona con el selector de color el tono para cada estado o indica cuál cuenta como completado.")
+
+    current_states = [item["Valor"] for item in st.session_state.app_config_list if item.get("Valor")]
+    default_ok_idx = current_states.index(st.session_state.label_ok) if st.session_state.label_ok in current_states else 0
+
+    selected_ok = st.selectbox(
+        "🏆 ¿Cuál estado cuenta como COMPLETADO / SUBIDO? (Para métricas y avances)",
+        options=current_states,
+        index=default_ok_idx,
+        help="El estado seleccionado sumará para el porcentaje de avance y expedientes listos."
+    )
+    if selected_ok != st.session_state.label_ok:
+        st.session_state.label_ok = selected_ok
+        for item in st.session_state.app_config_list:
+            item["Completado"] = "Sí" if item["Valor"] == selected_ok else "No"
+        st.rerun()
+
+    # Lista interactiva de tarjetas por cada estado
+    eliminar_idx = None
+    for idx, item in enumerate(st.session_state.app_config_list):
+        c_val = item["Valor"]
+        c_hex = item.get("Color Hex", "#ffffff")
+
+        with st.container(border=True):
+            col_b1, col_b2, col_b3, col_b4 = st.columns([3, 2, 2, 1])
+            with col_b1:
+                st.markdown(
+                    f'<div style="background-color: {c_hex}; color: #000; padding: 10px 14px; border-radius: 6px; font-weight: bold; border: 1px solid rgba(0,0,0,0.15); display: inline-block; min-width: 150px; text-align: center;">'
+                    f'{c_val}</div>',
+                    unsafe_allow_html=True
+                )
+                if c_val == st.session_state.label_ok:
+                    st.caption("⭐ Cuenta como completado")
+            with col_b2:
+                new_hex = st.color_picker(f"Color de {c_val}", value=c_hex, key=f"cp_{idx}_{c_val}")
+                if new_hex != c_hex:
+                    item["Color Hex"] = new_hex
+                    st.rerun()
+            with col_b3:
+                st.text_input("Código Hex", value=item["Color Hex"], key=f"hex_{idx}_{c_val}", disabled=True)
+            with col_b4:
+                if len(st.session_state.app_config_list) > 1:
+                    if st.button("🗑️", key=f"del_{idx}_{c_val}", help=f"Eliminar estado {c_val}"):
+                        eliminar_idx = idx
+
+    if eliminar_idx is not None:
+        st.session_state.app_config_list.pop(eliminar_idx)
+        if st.session_state.label_ok not in [x["Valor"] for x in st.session_state.app_config_list]:
+            if st.session_state.app_config_list:
+                st.session_state.label_ok = st.session_state.app_config_list[0]["Valor"]
+        st.rerun()
+
+    st.divider()
+
+    # Agregar nuevo estado
+    with st.expander("➕ Agregar un nuevo Estado"):
+        with st.form("form_nuevo_estado", clear_on_submit=True):
+            col_n1, col_n2 = st.columns(2)
+            with col_n1:
+                nuevo_nombre = st.text_input("Nombre del nuevo Estado", placeholder="Ej: OBSERVADO, EN TRAMITE")
+            with col_n2:
+                nuevo_color = st.color_picker("Color para el nuevo Estado", value="#fff2cc")
+            es_comp = st.checkbox("¿Este estado cuenta como expediente completado?")
+
+            if st.form_submit_button("Agregar Estado", type="primary"):
+                nombre_clean = nuevo_nombre.strip().upper()
+                if not nombre_clean:
+                    st.error("El nombre del estado no puede estar vacío.")
+                elif nombre_clean in [x["Valor"] for x in st.session_state.app_config_list]:
+                    st.error("Ese estado ya existe.")
+                else:
+                    st.session_state.app_config_list.append({
+                        "Valor": nombre_clean,
+                        "Color Hex": nuevo_color,
+                        "Completado": "Sí" if es_comp else "No"
+                    })
+                    if es_comp:
+                        st.session_state.label_ok = nombre_clean
+                    st.success(f"Estado '{nombre_clean}' agregado.")
+                    st.rerun()
+
+    st.divider()
+    st.subheader("Parámetros Generales de Lectura")
+    col_p1, col_p2 = st.columns(2)
+    with col_p1:
+        st.selectbox(
+            "¿La primera fila es encabezado?", ["Auto", "Sí", "No"],
+            help="Las columnas se leen por posición: A=Expediente, B=Banco, C=Registro, D=Observaciones.",
+            key="header_mode_select"
+        )
+    with col_p2:
+        st.number_input(
+            "Meta de expedientes del mes (0 = sin meta)",
+            min_value=0, value=0, step=10, key="meta_input"
+        )
 
 # ---------- Instrucciones ----------
 with tab_help:
